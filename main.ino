@@ -1,65 +1,168 @@
 #include <Servo.h>
+#include <Wire.h> // Biblioteca nativa do Arduino para o I2C (A4 e A5)
 
-const int PIN_TRIG = 9;
-const int PIN_ECHO = 10;
-const int PIN_SERVO = 6;
+const int trigPin = 10;
+const int echoPin = 11;
+const int servoPin = 9;
+
 Servo meuServo;
 
-const int ANGULO_SERVO_RETO = 90;
-const int MAX_INCLINACAO = 30;
+// --- CONFIGURAÇÕES DO MPU-6050 ---
+const int MPU_ADDR = 0x68; 
+int16_t AcX, AcY, AcZ;
 
-// PID otimizado para movimento contínuo
-double Kp = 2.0;   
-double Ki = 0.005; 
-double Kd = 9.0;   // Aumentamos o Kd para o sistema "frear" antes de chegar no limite
+// --- CONFIGURAÇÕES FÍSICAS ---
+int centroServo = 50;    
+double setpoint = 19.0;  
+double distanciaFiltrada = 19.0;
+const float alpha = 0.4; 
 
-double setpointDinamico = 17.875;
-double posicaoAtual = 17.875;
-double erro, erroAnterior = 0, integral = 0;
-
+// --- VARIÁVEIS DO CONTROLE PD ---
+double Kp = 1.8, Ki = 0.0, Kd = 2.5; 
+double erro, erroAnterior = 0;
 unsigned long tempoAnterior = 0;
-const unsigned long DT = 40;
+
+int anguloAtual = 50; 
+int modoResgate = 0; 
+
+// --- VARIÁVEIS DE DESATOLAMENTO ---
+unsigned long tempoInicioResgate = 0;
+unsigned long tempoPresoDireita = 0;
+bool presoDireita = false;
 
 void setup() {
-  Serial.begin(115200);
-  meuServo.attach(PIN_SERVO);
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
+  Serial.begin(115200); 
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  meuServo.attach(servoPin);
+  
+  meuServo.write(centroServo); 
+
+  // --- INICIALIZAÇÃO DO MPU-6050 ---
+  Wire.begin();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // Registro de gerenciamento de energia
+  Wire.write(0);    // Escreve 0 para acordar o sensor
+  Wire.endTransmission(true);
+  
+  delay(1000);
 }
 
 void loop() {
   unsigned long tempoAtual = millis();
-  if (tempoAtual - tempoAnterior >= DT) {
-    double dt = (tempoAtual - tempoAnterior) / 1000.0;
-    tempoAnterior = tempoAtual;
+  double dt = (double)(tempoAtual - tempoAnterior) / 1000.0;
 
-    // 1. Leitura
-    digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
-    digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10); // Ajustado para 10us padrão
-    digitalWrite(PIN_TRIG, LOW);
-    double dist = pulseIn(PIN_ECHO, HIGH, 15000) * 0.0343 / 2.0;
+  if (dt >= 0.02) { 
+    // --- 1. LEITURA DO MPU-6050 ---
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x3B); 
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 6, true); 
     
-    if (dist < 1.0 || dist > 40.0) dist = posicaoAtual;
-    posicaoAtual = (posicaoAtual * 0.6) + (dist * 0.4); 
+    AcX = Wire.read() << 8 | Wire.read(); 
+    AcY = Wire.read() << 8 | Wire.read(); 
+    AcZ = Wire.read() << 8 | Wire.read(); 
+    
+    // Calcula o ângulo real da bandeja (de -90 a 90 graus)
+    float anguloRealBandeja = atan2(AcY, sqrt(AcX * AcX + AcZ * AcZ)) * 180.0 / PI;
 
-    // 2. Trajetória Senoidal Contínua
-    setpointDinamico = 16.5 + 11.5 * sin((2.0 * PI * tempoAtual) / 15000.0);
+    // --- 2. LEITURA DA DISTÂNCIA ---
+    double rawDist = lerDistancia();
+    
+    // --- 3. MODO CEGO / PAREDE DA ESQUERDA (> 17.5cm) ---
+    if (rawDist == 0 || rawDist > 17.5) { 
+      
+      if (modoResgate == 0) {
+        tempoInicioResgate = tempoAtual; 
+        if (distanciaFiltrada >= 14.0) {
+          modoResgate = 1; 
+        } else {
+          modoResgate = 2; 
+        }
+      }
 
-    // 3. PID
-    erro = setpointDinamico - posicaoAtual;
-    integral = constrain(integral + (erro * dt), -2, 2);
-    double derivativo = (erro - erroAnterior) / dt;
-    double outputPID = (Kp * erro) + (Ki * integral) + (Kd * derivativo);
-    erroAnterior = erro;
+      if (tempoAtual - tempoInicioResgate > 3000) {
+        modoResgate = (modoResgate == 1) ? 2 : 1; 
+        tempoInicioResgate = tempoAtual; 
+      }
 
-    // 4. APLICAÇÃO DE FORÇA (Sem "Kicks" bruscos)
-    // Se o lado direito é lerdo, aplicamos um ganho proporcional ao erro, 
-    // não uma força fixa que trava o sistema.
-    if (outputPID < 0) {
-      outputPID *= 1.3; // Aumenta 30% da força apenas quando vai para a direita
+      if (modoResgate == 1) {
+        anguloAtual = 37; 
+      } else {
+        anguloAtual = 63; 
+      }
+      
+      meuServo.write(anguloAtual);
+      erroAnterior = 0; 
+      tempoAnterior = tempoAtual;
+      
+      // Imprime o log de emergência com o MPU
+      imprimirGrafico(distanciaFiltrada, erro, anguloAtual, anguloRealBandeja);
+      return; 
     }
 
-    outputPID = constrain(outputPID, -MAX_INCLINACAO, MAX_INCLINACAO);
-    meuServo.write(ANGULO_SERVO_RETO - (int)outputPID);
+    modoResgate = 0; 
+    distanciaFiltrada = (alpha * rawDist) + ((1.0 - alpha) * distanciaFiltrada);
+
+    // --- 4. PAREDE DA DIREITA ANTECIPADA (<= 11 cm) ---
+    if (distanciaFiltrada <= 11.0) {
+      
+      if (!presoDireita) {
+        presoDireita = true;
+        tempoPresoDireita = tempoAtual;
+      }
+
+      if (tempoAtual - tempoPresoDireita > 2000) {
+        anguloAtual = 37; 
+      } else {
+        anguloAtual = 63; 
+      }
+      
+      meuServo.write(anguloAtual); 
+      erroAnterior = setpoint - distanciaFiltrada;
+      tempoAnterior = tempoAtual;
+      
+      imprimirGrafico(distanciaFiltrada, erro, anguloAtual, anguloRealBandeja);
+      return; 
+    } else {
+      presoDireita = false; 
+    }
+
+    // --- 5. CÁLCULO DO PID --- 
+    erro = setpoint - distanciaFiltrada;
+    double derivativo = (erro - erroAnterior) / dt;
+    double output = (Kp * erro) + (Kd * derivativo);
+    
+    int anguloAlvo = centroServo + (int)output;
+    anguloAtual = constrain(anguloAlvo, 20, 80); 
+    
+    meuServo.write(anguloAtual); 
+    
+    // Imprime o gráfico em funcionamento normal
+    imprimirGrafico(distanciaFiltrada, erro, anguloAtual, anguloRealBandeja);
+    
+    erroAnterior = erro;
+    tempoAnterior = tempoAtual;
   }
+}
+
+// --- FUNÇÃO PARA MANTER A PLOTADORA LIMPA ---
+void imprimirGrafico(double dist, double err, int angServo, float angReal) {
+    Serial.print("Dist:"); Serial.print(dist); Serial.print(",");
+    // Multiplicado por 10 para ficar mais visível junto com os ângulos no gráfico
+    Serial.print("ErroX10:"); Serial.print(err * 10); Serial.print(","); 
+    Serial.print("AnguloServo:"); Serial.print(angServo); Serial.print(",");
+    Serial.print("AnguloReal:"); Serial.println(angReal);
+}
+
+double lerDistancia() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duracao = pulseIn(echoPin, HIGH, 3000); 
+  if (duracao == 0) return 999.0; 
+  return (duracao * 0.034 / 2.0);
 }
